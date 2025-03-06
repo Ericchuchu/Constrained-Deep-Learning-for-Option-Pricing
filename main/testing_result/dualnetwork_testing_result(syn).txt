@@ -1,0 +1,6 @@
+TEST Metrics:
+Average LOSS: 6482.70311
+Average MAP: 52.73847
+Average MAPE: 4.15240
+Average CORR: 0.98696
+Results saved to Feb09_144943_dual_network_results.csv

@@ -1,0 +1,7 @@
+
+Testing the model
+MSE: 1363.10291
+RMSE: 36.92022
+MAP: 22.28130
+MAPE: 24.44656
+Correlation: 0.81916
