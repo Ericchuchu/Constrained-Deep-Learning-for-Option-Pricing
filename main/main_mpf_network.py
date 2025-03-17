@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils import data
 from torch.utils.data import DataLoader, TensorDataset
+from transformers import get_cosine_schedule_with_warmup
 from core.models_multi_patch_former_adjusted import MultiPatchFormer
 import numpy as np
 from datetime import datetime
@@ -28,11 +29,11 @@ class DataProcessor:
     def compute_train_kde(self, train_input: torch.Tensor):
         """Compute KDE model from training dataset's invm values."""
         # Extract required values from training data
-        moneyness = train_input[:, 0, -1, 4].numpy()
+        time_value = train_input[:, 0, -1, 1].numpy()
                 
         # Fit KDE model
-        self.kde_model = gaussian_kde(moneyness.reshape(-1, 1).T, bw_method=0.5)
-        weights = 1.0 / (self.kde_model(moneyness.reshape(-1, 1).T) + 1e-6)
+        self.kde_model = gaussian_kde(time_value.reshape(-1, 1).T, bw_method=0.5)
+        weights = 1.0 / (self.kde_model(time_value.reshape(-1, 1).T) + 1e-6)
         weights = torch.tensor(weights)
         mean_weights = weights.mean()
         
@@ -94,17 +95,17 @@ def compute_losses(criterion, x_input, input_tensor_norm, output, y, kde_model, 
     V = output
 
     # Extract moneyness
-    moneyness = x_input[:, 0, -1, 4].detach().cpu().numpy()
+    time_value = x_input[:, 0, -1, 1].detach().cpu().numpy()
 
     # Fit KDE: invm is already a numpy array, so reshape as required
-    weights = 1.0 / (kde_model(moneyness.reshape(1, -1)) + 1e-6)
+    weights = 1.0 / (kde_model(time_value.reshape(1, -1)) + 1e-6)
     
     # Convert weights back to tensor
     weights = torch.tensor(weights, device=V.device, dtype=V.dtype)
-    weights = weights / mean_weights  # Normalize weights
+    weights = weights / mean_weights # Normalize weights
     
     # Compute weighted MSE loss
-    mse_loss = torch.mean(weights * (V - y) ** 2)
+    mse_loss = torch.sum(weights * (V - y) ** 2) / torch.sum(weights)
     
     return mse_loss 
 
@@ -133,17 +134,15 @@ def evaluate(model, data_loader, criterion, dict, device, last_epoch=False):
 
 def train_model(model: nn.Module, train_loader: data.DataLoader, valid_loader: data.DataLoader, test_loader: data.DataLoader, input_tensor_norm: Normalization,
                 optimizer: torch.optim, num_epochs: int, device: torch.device, args: argparse.ArgumentParser, mean_weights: torch.Tensor, kde_model=None) -> Tuple[dict, dict, dict]:
-    # Initialize learning rate scheduler with configurable parameters
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
-        mode='min',
-        factor=args.lr_factor,
-        patience=args.lr_patience,
-        threshold=args.lr_threshold,
-        threshold_mode='rel',
-        cooldown=args.lr_cooldown,
-        min_lr=args.min_lr,
-        eps=1e-8
+    # Calculate total training steps for the scheduler
+    total_steps = len(train_loader) * num_epochs
+    
+    # Initialize learning rate scheduler with linear warmup and cosine decay
+    # This is more suitable for Transformer-based models like Multi-Patch Former
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(args.warmup_ratio * total_steps),  # Warmup steps based on ratio
+        num_training_steps=total_steps
     )
     
     criterion = nn.MSELoss()
@@ -155,7 +154,7 @@ def train_model(model: nn.Module, train_loader: data.DataLoader, valid_loader: d
     test_losses = []
     
     best_valid_loss = float('inf')
-    patience = 5
+    patience = 6
     trigger_times = 0
     early_stop = False
     minimum_test_loss_epoch = 0
@@ -175,7 +174,9 @@ def train_model(model: nn.Module, train_loader: data.DataLoader, valid_loader: d
             
             optimizer.zero_grad()
             output = model(x_input)
+            # adjusted loss using KDE
             adjusted_loss = compute_losses(criterion, x_input, input_tensor_norm, output, y, kde_model, mean_weights)
+            # adjusted_loss = criterion(output, y)
             loss_value = adjusted_loss.detach().item()
             adjusted_loss.backward()
             
@@ -183,6 +184,7 @@ def train_model(model: nn.Module, train_loader: data.DataLoader, valid_loader: d
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             
             optimizer.step()
+            scheduler.step()  # Update scheduler after each batch
             epoch_losses.append(loss_value)
 
             # Store losses for the last epoch
@@ -201,12 +203,9 @@ def train_model(model: nn.Module, train_loader: data.DataLoader, valid_loader: d
         # Evaluate on validation and test sets
         valid_loss, valid_loss_dict = evaluate(model, valid_loader, criterion, valid_loss_dict, device, epoch == (num_epochs - 1))
         test_loss, test_loss_dict = evaluate(model, test_loader, criterion, test_loss_dict, device, epoch == (num_epochs - 1))
-        
+
         valid_losses.append(valid_loss)
         test_losses.append(test_loss)
-
-        # Update learning rate scheduler
-        scheduler.step(valid_loss)
 
         # Track best performance
         if valid_loss < best_valid_loss:
@@ -219,11 +218,13 @@ def train_model(model: nn.Module, train_loader: data.DataLoader, valid_loader: d
                 'scheduler_state_dict': scheduler.state_dict(),
                 'valid_loss': valid_loss,
             }, f"checkpoints/mpf_network_best.pth")
-            
-            trigger_times = 0
-        else:
+
+        patience_delta = 0.03
+        if valid_loss > best_valid_loss * (1 + patience_delta):
             trigger_times += 1
-            
+        else:
+            trigger_times = 0
+                        
         # Track best test performance
         if test_loss < best_test_loss:
             best_test_loss = test_loss
@@ -273,8 +274,7 @@ def test_model(model: nn.Module, data_loader: data.DataLoader, dataset_type: str
     
     results = {
         'timestamp': [], 'true_price': [], 'estimated_price': [],
-        'moneyness': [], 'time_to_maturity': [], 
-        'volume': [], 'underlying_price': [], 'cp_flag':[]
+        'moneyness': [], 'time_to_maturity': []
     }
     
     metrics_list = {'loss': [], 'map': [], 'mape': [], 'corr': []}
@@ -290,8 +290,6 @@ def test_model(model: nn.Module, data_loader: data.DataLoader, dataset_type: str
             # Unnormalize predictions and true values
             y = label_norm.unnormalize(y)
             y_hat = label_norm.unnormalize(output)
-            y = torch.exp(y)
-            y_hat = torch.exp(y_hat)
             
             # Calculate metrics
             loss = criterion(y, y_hat)
@@ -310,11 +308,8 @@ def test_model(model: nn.Module, data_loader: data.DataLoader, dataset_type: str
             results['timestamp'].extend([''.join(str(t) for t in ts) for ts in timestamp.cpu().numpy()])
             results['true_price'].extend(y.cpu().numpy())
             results['estimated_price'].extend(y_hat.cpu().numpy())
-            results['moneyness'].extend(x_input[:,0,-1,4].cpu().numpy())
-            results['time_to_maturity'].extend(x_input[:,0,-1,2].cpu().numpy())
-            results['volume'].extend(x_input[:,0,-1,0].cpu().numpy())
-            results['underlying_price'].extend(x_input[:,2,-1,2].cpu().numpy())
-            results['cp_flag'].extend(x_input[:,0,-1,1].cpu().numpy())
+            results['moneyness'].extend(x_input[:,0,-1,2].cpu().numpy())
+            results['time_to_maturity'].extend(x_input[:,0,-1,0].cpu().numpy())
     
     # Print average metrics
     print(f"\n{dataset_type.upper()} Metrics:")
@@ -455,7 +450,7 @@ def plot_timestamp_loss_modified(train_loss_dict, valid_loss_dict, test_loss_dic
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-learning_rate', type=float, default=0.0001, help="learning rate of the Adam")
+    parser.add_argument('-learning_rate', type=float, default= 1e-4, help="learning rate of the Adam")
     parser.add_argument('-max_epoch', type=int, default=100, help="maximum number of training epochs")
     parser.add_argument('-batch_size', type=int, default=64, help="Batch size for training")
     parser.add_argument('-session_name', type=str, action="store", default=datetime.now().strftime('%b%d_%H%M%S'),
@@ -464,23 +459,21 @@ def main():
                         help="path to model to test on. When this flag is used, no training is performed")
     parser.add_argument('-nonlinearity', action="store", type=str, default="tanh",
                         help="Type of nonlinearity for the CNN [tanh, relu]", choices=["tanh", "relu"])
-    parser.add_argument('-early_stop_mode', type=bool, default=False, help="training the model with early stop mode")
+    parser.add_argument('-early_stop_mode', action='store_true', help="training the model with early stop mode")  
     parser.add_argument('-train_days', type=int, default=3, help="the days for training")
     parser.add_argument('-valid_days', type=int, default=1, help="the days for validating")
     parser.add_argument('-test_days', type=int, default=1, help="the days for testing")
     parser.add_argument('-syn_data', type=bool, default=True, help="synthesize the missing data from TAIEX website")
     
-    # Learning rate scheduler parameters
-    parser.add_argument('-lr_factor', type=float, default=0.5, help="Factor by which the learning rate will be reduced")
-    parser.add_argument('-lr_patience', type=int, default=3, help="Number of epochs with no improvement after which learning rate will be reduced")
-    parser.add_argument('-lr_threshold', type=float, default=0.0001, help="Threshold for measuring the new optimum")
-    parser.add_argument('-lr_cooldown', type=int, default=0, help="Number of epochs to wait before resuming normal operation after lr has been reduced")
-    parser.add_argument('-min_lr', type=float, default=1e-6, help="Lower bound on the learning rate")
+    # Learning rate scheduler parameters for cosine scheduler with warmup
+    parser.add_argument('-warmup_ratio', type=float, default=0.1, help="Ratio of total training steps to use for warmup")
+    parser.add_argument('-min_lr', type=float, default=1e-6, help="Minimum learning rate at the end of the schedule")
 
     args = parser.parse_args()
     
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("mps")
     print(f'Using device: {device}')
     
     # Set data directory
@@ -510,11 +503,11 @@ def main():
         _, C, S, F = raw_data['train'][0].shape
         
         model = MultiPatchFormer(
-            patch_configs=[(2, 1), (3, 1)],  # Example patch configs for sequence
+            patch_configs=[(2, 1), (3,1), (4,1), (5, 1)],  # Example patch configs for sequence
             feature_shape=F,
-            embed_dim=32,
+            embed_dim=128,
             in_channels=C,
-            temporal_layers=2,
+            temporal_layers=3,
             temporal_heads=4,
             channel_heads=4,
             decoder_patch_length=2,
@@ -540,6 +533,14 @@ def main():
                 optimizer, args.max_epoch, device, args, mean_weights, kde_model
             )
             plot_timestamp_loss_modified(train_loss_dict, valid_loss_dict, test_loss_dict, args)
+
+        # Load model with minimum valid loss
+        # Load the checkpoint
+        checkpoint = torch.load(f"checkpoints/mpf_network_best.pth", map_location=device)
+        
+        # Load model state
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model = model.to(device)
 
         # Evaluate model
         test_results_df = test_model(

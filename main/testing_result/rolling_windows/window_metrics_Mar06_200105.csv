@@ -1,0 +1,2 @@
+window_idx,train_start_date,train_end_date,test_start_date,test_end_date,test_loss,test_corr,test_map,test_mape,early_stop
+0,2021-11-19,2021-12-20,2021-12-09,2021-12-24,0.1545810103416443,tensor([0.9208]),tensor([0.3101]),tensor([1.3606]),False

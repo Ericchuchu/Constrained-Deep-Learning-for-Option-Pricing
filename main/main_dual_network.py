@@ -520,7 +520,7 @@ def main():
                         help="path to model to test on. When this flag is used, no training is performed")
     parser.add_argument('-nonlinearity', action="store", type=str, default="tanh",
                         help="Type of nonlinearity for the CNN [tanh, relu]", choices=["tanh", "relu"])
-    parser.add_argument('-early_stop_mode', type=bool, default=False, help="training the model with early stop mode")
+    parser.add_argument('-early_stop_mode', type=bool, default=True, help="training the model with early stop mode")
     parser.add_argument('-train_days', type=int, default=3, help="the days for training")
     parser.add_argument('-valid_days', type=int, default=1, help="the days for validating")
     parser.add_argument('-test_days', type=int, default=1, help="the days for testing")

@@ -1,0 +1,6 @@
+TEST Metrics:
+Average LOSS: 13463.55636
+Average MAP: 66.08393
+Average MAPE: 3.61864
+Average CORR: 0.97350
+Results saved to Mar09_062815_mpf_network_results.csv

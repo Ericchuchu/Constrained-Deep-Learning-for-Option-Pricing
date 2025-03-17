@@ -7,8 +7,9 @@ import sys
 
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(base_dir)
+
 from core.models_convlstm import ConvLSTMCell
-from core.models_multi_patch_former import MultiPatchFormer
+from core.models_multi_patch_former_adjusted import MultiPatchFormer
 
 class DatePositionalEncoding(nn.Module):
     """Date tensor positional encoding optimized by precomputing constants."""
@@ -25,12 +26,12 @@ class DatePositionalEncoding(nn.Module):
         returns: [batch_size, seq_len, d_model]
         """
         # 利用 broadcasting 自動對齊形狀
-        # date_positions.unsqueeze(-1): [B, seq_len, 1]
-        # self.div_term: [d_model/2]，經 broadcasting 變成 [B, seq_len, d_model/2]
-        pe = torch.zeros(date_positions.size(0), date_positions.size(1), self.d_model, device=date_positions.device)
+        # date_positions.unsqueeze(-1): [B, channel, seq_len, 1]
+        # self.div_term: [d_model/2]，經 broadcasting 變成 [B, channel, seq_len, d_model/2]
+        pe = torch.zeros(date_positions.size(0), date_positions.size(1), date_positions.size(2), self.d_model, device=date_positions.device)
         # 使用 broadcasting 計算 sin 和 cos，不需要手動 unsqueeze div_term
-        pe[:, :, 0::2] = torch.sin(date_positions.unsqueeze(-1).float() * self.div_term)
-        pe[:, :, 1::2] = torch.cos(date_positions.unsqueeze(-1).float() * self.div_term)
+        pe[:, :, :, 0::2] = torch.sin(date_positions.unsqueeze(-1).float() * self.div_term)
+        pe[:, :, :, 1::2] = torch.cos(date_positions.unsqueeze(-1).float() * self.div_term)
         return pe
 
 class PositionalEncoding(nn.Module):
@@ -41,9 +42,9 @@ class PositionalEncoding(nn.Module):
         # 預計算所有位置的編碼
         position = torch.arange(max_len, dtype=torch.float).unsqueeze(1)  # [max_len, 1]
         div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(1, max_len, d_model)
-        pe[0, :, 0::2] = torch.sin(position * div_term)
-        pe[0, :, 1::2] = torch.cos(position * div_term)
+        pe = torch.zeros(1, 1, max_len, d_model)
+        pe[0, :, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, :, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe)
 
     def forward(self, x):
@@ -53,7 +54,7 @@ class PositionalEncoding(nn.Module):
         """
         seq_len = x.size(1)
         # 直接從預計算的 pe 中取前 seq_len 個
-        x = x + self.pe[:, :seq_len, :]
+        x = x + self.pe[:, :, :seq_len, :]
         return self.dropout(x)
     
 class ConstrainedLinear(nn.Module):
@@ -85,7 +86,9 @@ class MultPatchFormerEncoder(nn.Module):
         
         # Transformer encoder layer
         self.multi_patch_former = MultiPatchFormer(patch_configs=[(2, 1), (3, 1)],
+                                                    feature_shape=d_model,
                                                     embed_dim=32,
+                                                    in_channels=1,
                                                     temporal_layers=1,
                                                     temporal_heads=4,
                                                     channel_heads=4,
@@ -97,24 +100,24 @@ class MultPatchFormerEncoder(nn.Module):
     
     def forward(self, x):
         # x shape: [batch_size, seq_len, 2] (first vector: moneyness, second vector: date_position)
-        moneyness = x[:, :, 0:1]  # shape: [batch_size, seq_len, 1]
-        date_positions = x[:, :, 1].long()  # shape: [batch_size, seq_len]
+        moneyness = x[:, 0:1, :, 0:1]  # shape: [batch_size, channel, seq_len, 1]
+        date_positions = x[:, 0:1, :, 1].long()  # shape: [batch_size, channel, seq_len]
         
         # Project moneyness
-        moneyness_encoded = self.moneyness_proj(moneyness)  # [batch_size, seq_len, d_model]
+        moneyness_encoded = self.moneyness_proj(moneyness)  # [batch_size, chnnel, seq_len, d_model]
         
         # Get date positional encodings
-        date_pos = self.date_pos_encoder(date_positions)  # [batch_size, seq_len, d_model]
+        date_pos = self.date_pos_encoder(date_positions)  # [batch_size, channel, seq_len, d_model]
         
         # Concat moneyness features with date positional encoding 
-        x = torch.cat([moneyness_encoded, date_pos], dim=-1)  # [batch_size, seq_len, 2*d_model]
+        x = torch.cat([moneyness_encoded, date_pos], dim=-1)  # [batch_size, channel,seq_len, 2*d_model]
         
         # Project the concatenated features back to d_model
-        x = self.fusion_proj(x)  # [batch_size, seq_len, d_model]
+        x = self.fusion_proj(x)  # [batch_size, channel,seq_len, d_model]
         
         # Add sequence positional encoding
         x = self.seq_pos_encoder(x)
-        
+
         # Pass through transformer encoder
         output = self.multi_patch_former(x)  # [batch_size, d_model]
         
@@ -234,7 +237,7 @@ class DualBranchNetwork(nn.Module):
 # test
 if __name__ == '__main__':
     input_convlstm = torch.normal(0, 1, size=(64, 3, 10, 5))
-    input_transformer = torch.normal(0, 1, size=(64, 10, 2))
+    input_transformer = torch.normal(0, 1, size=(64, 1, 10, 2))
     model = DualBranchNetwork()
     output = model(input_convlstm, input_transformer)
     print(f'Output shape : {output[0].shape}' )

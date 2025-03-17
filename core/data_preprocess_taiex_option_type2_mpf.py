@@ -40,10 +40,29 @@ def data_preprocess():
         data['vega'] = data.apply(BSM_vega, axis=1)
         data['theory_price'] = data.apply(calculate_theory_price, axis=1)
 
+
+        # put call parity
+        data['option_price'] = data.apply(
+            lambda row: put_to_call_parity(row) if row['PC'] == 'P' else row['option_price'], 
+            axis=1
+        )
+
         # moneyness based on option type
+        # data['normalized_moneyness'] = data.apply(
+        #     lambda row: -log(row['invm'])/(row['impl_volatility']*sqrt(row['tau'])) if row['PC'] == 'C' 
+        #     else log(row['invm'])/(row['impl_volatility']*sqrt(row['tau'])), 
+        #     axis=1
+        # )
+
         data['moneyness'] = data.apply(
-            lambda row: -log(row['invm'])/(row['impl_volatility']*sqrt(row['tau'])) if row['PC'] == 'C' 
-            else log(row['invm'])/(row['impl_volatility']*sqrt(row['tau'])), 
+            lambda row: -log(row['invm'])/(row['impl_volatility']*sqrt(row['tau'])),
+            axis=1
+        )
+
+        # Compute Time Value (TV)
+        epsilon = 1e-6 
+        data['time_value'] = data.apply(lambda row: 
+            row['option_price'] - max(row['S'] - row['strike_price'], 0) + epsilon,
             axis=1
         )
 
@@ -55,15 +74,15 @@ def data_preprocess():
         # Convert PC to numeric
         data['PC'] = data['PC'].map({'C': 0, 'P': 1})
         
+        # clean data
+        data = data.replace([np.inf, -np.inf], np.nan)
         data = data.dropna().reset_index(drop=True)
 
         # apply log scaling
-        epsilon = 1e-10  # 或其他適合您數據範圍的小常數
-        data['option_price'] = np.log(data['option_price'] + epsilon)
-        data['pre_settle_price'] = np.log(data['pre_settle_price'] + epsilon)
-        data['theory_price'] = np.log(data['theory_price'] + epsilon)
-        data['strike_price'] = np.log(data['strike_price'] + epsilon)
-        data['S'] = np.log(data['S']+ epsilon)
+        # epsilon = 1e-10  # 或其他適合您數據範圍的小常數
+        # data['pre_settle_price'] = np.log(data['pre_settle_price'] + epsilon)
+        # data['strike_price'] = np.log(data['strike_price'] + epsilon)
+        # data['S'] = np.log(data['S']+ epsilon)
 
         data.to_csv(output_file_path)
         print("Dataset preprocessed and saved to prs_dataset_mpf.csv")
@@ -112,26 +131,27 @@ def spline_interpolate(data):
     return data
 
 def build_input_label(data, index, seq_len):
-    input = torch.zeros((3, seq_len, 5))
+    input = torch.zeros((3, seq_len, 4))
 
     tmp_input = data.iloc[index:index+seq_len+1]
     if len(tmp_input) < seq_len + 1:
         return None, None, None, None
         
-    # ConvLSTM input
-    input[0, :] = torch.tensor(np.array(tmp_input.iloc[0:seq_len][['volume','PC','tau','impl_volatility','moneyness']], dtype=np.float64))
-    input[1, :] = torch.tensor(np.array(tmp_input.iloc[0:seq_len][['delta','gamma','rho','theta','vega']], dtype=np.float64))
-    input[2, :] = torch.tensor(np.array(tmp_input.iloc[0:seq_len][['option_price','settle_price_chg','S','theory_margin','theory_price']], dtype=np.float64))
-    
-    label = torch.tensor(np.array(tmp_input.iloc[seq_len]['option_price'], dtype=np.float64))
+    # 3D tensor input
+    input[0, :] = torch.tensor(np.array(tmp_input.iloc[0:seq_len][['volume', 'strike_price', 'moneyness', 'time_value']], dtype=np.float64))
+    input[1, :] = torch.tensor(np.array(tmp_input.iloc[0:seq_len][['delta', 'rho', 'theta', 'gamma']], dtype=np.float64))
+    input[2, :] = torch.tensor(np.array(tmp_input.iloc[0:seq_len][['pre_settle_price', 'settle_price_chg', 'theory_margin', 'theory_price']], dtype=np.float64))
+
+    label = torch.tensor(np.array(tmp_input.iloc[seq_len]['time_value'], dtype=np.float64))
     date_tensor = torch.tensor(np.array([tmp_input.iloc[seq_len]['date'].year, 
-                                       tmp_input.iloc[seq_len]['date'].month, 
-                                       tmp_input.iloc[seq_len]['date'].day], dtype=np.int64))
+                                        tmp_input.iloc[seq_len]['date'].month, 
+                                        tmp_input.iloc[seq_len]['date'].day], dtype=np.int64))
     
     return input, label, date_tensor
 
 
 def prepare_data(data, seq_len=10, train_days=3, valid_days=1, test_days=1):
+    print(f'prepare splited data')
     train_input = []
     train_label = []
     valid_input = []
@@ -220,25 +240,7 @@ def prepare_data(data, seq_len=10, train_days=3, valid_days=1, test_days=1):
             valid_input, valid_label, valid_label_timestamp,
             test_input, test_label, test_label_timestamp)
 
-def prepare_rolling_window_data(data, seq_len=10, initial_train_days=3, valid_days=1, test_days=1, subsequent_train_days=5):
-    """
-    累積滾動策略：
-    1. 第一個窗口：使用前 initial_train_days 天訓練，接著的 valid_days 天驗證，再接著 test_days 天測試
-    2. 第二個窗口：將先前的(訓練+驗證+測試)資料全部納入訓練集，總計 subsequent_train_days 天訓練，
-       然後使用接下來的 valid_days 天驗證，再接著 test_days 天測試
-    3. 依此類推
-    
-    Args:
-        data: 輸入的資料 DataFrame
-        seq_len: 序列長度
-        initial_train_days: 第一個窗口的訓練天數
-        valid_days: 每個窗口的驗證天數
-        test_days: 每個窗口的測試天數
-        subsequent_train_days: 後續窗口的訓練天數
-    
-    Returns:
-        包含每個滾動窗口的訓練、驗證、測試資料的字典列表
-    """
+def prepare_rolling_window_data(data, seq_len=10, initial_train_days=20, valid_days=2, test_days=2, subsequent_train_days=5):
     # 排序日期
     unique_dates = sorted(data['date'].unique())
     
@@ -328,7 +330,7 @@ def prepare_rolling_window_data(data, seq_len=10, initial_train_days=3, valid_da
             
             # 處理測試資料
             if len(test_data) >= seq_len + 1:
-                for j in range(len(test_data) - seq_len):
+                for j in range(len(test_data)-seq_len):         
                     input_tensor, label_tensor, date_tensor = build_input_label(test_data, j, seq_len)
                     if input_tensor is not None:
                         window_data['test_input'].append(input_tensor)
@@ -383,7 +385,7 @@ def prepare_rolling_window_data(data, seq_len=10, initial_train_days=3, valid_da
     return all_windows
 
 if __name__ == "__main__":
-    config = {"prepare splited data": True, "prepare rolling data":False}
+    config = {"prepare splited data": True, "prepare for rolling data": False}
     data = data_preprocess()
     if config.get("prepare for rolling data"):
         prepare_rolling_window_data(data)

@@ -13,7 +13,7 @@ def calculate_date_position(dates, base_date=None):
     return [(date - base_date).days for date in dates]
 
 def data_preprocess():
-    output_file_path = r"/home/0283901/chu1/3D-Tensor-based-Deep-Learning-Models-for-Predicting-Option-Price-main/data/prs_dataset_dual.csv"
+    output_file_path = r"/Users/chuchu/Desktop/option_pricing_thesis_project/3D-Tensor-based-Deep-Learning-Models-for-Predicting-Option-Price-main/data/prs_dataset_dual.csv"
 
     # Check if preprocessed file exists
     if os.path.exists(output_file_path):
@@ -56,6 +56,13 @@ def data_preprocess():
         data['PC'] = data['PC'].map({'C': 0, 'P': 1})
         
         data = data.dropna().reset_index(drop=True)
+
+        # apply log scaling
+        # epsilon = 1e-10  # 或其他適合您數據範圍的小常數
+        # data['pre_settle_price'] = np.log(data['pre_settle_price'] + epsilon)
+        # data['strike_price'] = np.log(data['strike_price'] + epsilon)
+        # data['S'] = np.log(data['S']+ epsilon)
+
         data.to_csv(output_file_path)
         print("Dataset preprocessed and saved to prs_dataset_dual.csv")
     
@@ -104,7 +111,7 @@ def spline_interpolate(data):
 
 def build_input_label(data, index, seq_len):
     input_convlstm = torch.zeros((3, seq_len, 5))
-    input_transformer = torch.zeros((seq_len, 2))  # [transformed_moneyness, date_position]
+    input_transformer = torch.zeros((1, seq_len, 2))  # [transformed_moneyness, date_position]
     
     tmp_input = data.iloc[index:index+seq_len+1]
     if len(tmp_input) < seq_len + 1:
@@ -116,8 +123,8 @@ def build_input_label(data, index, seq_len):
     input_convlstm[2, :] = torch.tensor(np.array(tmp_input.iloc[0:seq_len][['pre_settle_price','settle_price_chg','S','theory_margin','theory_price']], dtype=np.float64))
     
     # Transformer input - transformed moneyness and date position
-    input_transformer[:, 0] = torch.tensor(np.array(tmp_input.iloc[0:seq_len]['transformed_moneyness'], dtype=np.float64))
-    input_transformer[:, 1] = torch.tensor(np.array(tmp_input.iloc[0:seq_len]['date_position'], dtype=np.float64))
+    input_transformer[:, :, 0] = torch.tensor(np.array(tmp_input.iloc[0:seq_len]['transformed_moneyness'], dtype=np.float64))
+    input_transformer[:, :, 1] = torch.tensor(np.array(tmp_input.iloc[0:seq_len]['date_position'], dtype=np.float64))
     
     label = torch.tensor(np.array(tmp_input.iloc[seq_len]['option_price'], dtype=np.float64))
     date_tensor = torch.tensor(np.array([tmp_input.iloc[seq_len]['date'].year, 
@@ -207,7 +214,7 @@ def prepare_data(data, seq_len=10, train_days=3, valid_days=1, test_days=1):
     test_label_timestamp = torch.stack(test_label_timestamp)
 
     # Save tensors
-    save_dir = "/home/0283901/chu1/3D-Tensor-based-Deep-Learning-Models-for-Predicting-Option-Price-main/data/torch-data"
+    save_dir = "/Users/chuchu/Desktop/option_pricing_thesis_project/3D-Tensor-based-Deep-Learning-Models-for-Predicting-Option-Price-main/data/torch-data"
     torch.save(train_input_convlstm, f"{save_dir}/train_input_convlstm_dual.pt")
     torch.save(train_input_transformer, f"{save_dir}/train_input_transformer_dual.pt")
     torch.save(train_label, f"{save_dir}/train_label_dual.pt")

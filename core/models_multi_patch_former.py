@@ -73,7 +73,7 @@ class TemporalEncoder(nn.Module):
 class ChannelWiseEncoder(nn.Module):
     def __init__(self, embed_dim, num_heads=4, dropout=0.1):
         """
-        對於每個 token，跨 feature (channel) 進行多頭自注意力
+        對於每個 token，跨 feature (channel) 進行多頭自注意力 nn.Dropout(dropout),
         input shape shape: (B, tokens, F, embed_dim)
         output shape: (B, tokens, F, embed_dim)
         """

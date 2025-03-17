@@ -41,7 +41,7 @@ class DataProcessor:
         """Compute KDE model for a specific window's training data."""
         # Extract moneyness values from training data
         train_input = window_data['train_input']
-        moneyness = train_input[:, 0, -1, 4].numpy()
+        moneyness = train_input[:, 0, -1, 2].numpy()
                 
         # Fit KDE model
         kde_model = gaussian_kde(moneyness.reshape(-1, 1).T, bw_method=0.5)
@@ -108,7 +108,7 @@ def compute_losses(criterion, x_input, input_tensor_norm, output, y, kde_model):
     V = output
 
     # Extract moneyness
-    moneyness = x_input[:, 0, -1, 4].detach().cpu().numpy()
+    moneyness = x_input[:, 0, -1, 2].detach().cpu().numpy()
 
     # Fit KDE: invm is already a numpy array, so reshape as required
     weights = 1.0 / (kde_model(moneyness.reshape(1, -1)) + 1e-6)
@@ -191,7 +191,7 @@ def train_window_model(model, window_data, optimizer, device, args, kde_model):
     valid_losses = []
     
     best_valid_loss = float('inf')
-    patience = 5
+    patience = 8
     trigger_times = 0
     early_stop = False
     best_model_state = None
@@ -314,7 +314,7 @@ def adaptive_ensemble(all_models, window_data, device):
     model_performances.sort(key=lambda x: x[1])
     
     # 選擇表現最好的幾個模型
-    top_k = min(5, len(model_performances))
+    top_k = min(2, len(model_performances))
     selected_models = [all_models[idx] for idx, _ in model_performances[:top_k]]
     
     # 計算權重（基於驗證損失的倒數）
@@ -362,8 +362,8 @@ def test_window_model_ensemble(models, weights, window_data, device, window_idx)
     corr, map_val, mape = metrics(all_predictions, all_targets)
     
     # Extract feature from input
-    moneyness = window_data['test_input'][:,0,-1,4]
-    time_to_maturity = window_data['test_input'][:,0,-1,2]
+    moneyness = window_data['test_input'][:,0,-1,2]
+    time_to_maturity = window_data['test_input'][:,0,-1,0]
     
     # Unnormalize predictions and targets
     predictions_unnorm = window_data['label_norm'].unnormalize(all_predictions)
@@ -668,9 +668,9 @@ def main():
                     print("Initializing new model for this window (no transfer learning)")
                 
                 model = MultiPatchFormer(
-                    patch_configs=[(2, 1), (3, 1)],
+                    patch_configs=[(2, 1), (2,3), (3, 1), (3,2)],
                     feature_shape=F,
-                    embed_dim=32,
+                    embed_dim=16,
                     in_channels=C,
                     temporal_layers=2,
                     temporal_heads=4,
@@ -685,7 +685,15 @@ def main():
                 print("Using previous window's model as starting point (transfer learning)")
             
             # Initialize optimizer for this window
-            optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+            # If it's the first window, use the default learning rate
+            # Otherwise, use the learning rate from the previous window's optimizer
+            if window_idx == 0:
+                current_lr = args.learning_rate
+            else:
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"Using learning rate from previous window: {current_lr:.6f}")
+            
+            optimizer = optim.Adam(model.parameters(), lr=current_lr)
             
             # Train model on this window
             model, train_losses, valid_losses, early_stop = train_window_model(
@@ -775,7 +783,22 @@ def main():
         print(f"Results saved to testing_result/rolling_windows/all_window_results_{timestamp}.csv")
         print(f"Window metrics saved to testing_result/rolling_windows/window_metrics_{timestamp}.csv")
         print("="*50)
-        
+
+        # total test metrics
+        y_true = all_results_df['true_price'].values
+        y_pred = all_results_df['estimated_price'].values
+
+        mse_loss = np.mean((y_true - y_pred) ** 2)
+        corr, map, mape = metrics(y_true, y_pred)
+        print("\n" + "="*50)
+        print("TEST metrics")
+        print(f"MSE Loss: {mse_loss:.6f}")
+        print(f"Correlation: {corr.item():.6f}")
+        print(f"MAP: {map.item():.6f}")
+        print(f"MAPE: {mape.item():.6f}")
+        print("="*50)
+
+
     except Exception as e:
         print(f"An error occurred: {str(e)}")
         import traceback
