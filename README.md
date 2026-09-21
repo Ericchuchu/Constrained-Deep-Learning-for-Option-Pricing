@@ -1,231 +1,111 @@
-# 3D Tensor-based Deep Learning Models for Predicting Option Price
+# Deep Learning for TAIEX Option Pricing with 3D Tensor Inputs
 
-This repository contains the implementation of advanced deep learning models for option pricing prediction, as described in the manuscript "3D Tensor-based Deep Learning Models for Predicting Option Price".
+Undergraduate research project (National Yang Ming Chiao Tung University, 2024–2025) on one-day-ahead pricing of TAIEX index options (TXO). Each contract's last 10 trading days are arranged as a three-channel tensor (contract terms and volume, Greeks, prices) and passed to convolutional-recurrent and Transformer models.
 
-## Project Overview
+The tensor representation and the ConvLSTM / LSTM baselines follow **Ge, Zhou, Luo and Tian (2021), "3D Tensor-based Deep Learning Models for Predicting Option Price"** ([arXiv:2106.02916](https://arxiv.org/abs/2106.02916)), which studied Chinese 50ETF options. This repository applies the framework to the Taiwan market and extends it:
 
-This project explores novel deep learning approaches for option pricing, focusing on 3D tensor-based models that can effectively capture the complex relationships between various market factors. The models are designed to predict option prices based on historical data, outperforming traditional pricing methods in terms of accuracy and adaptability to market conditions.
+- a TXO data pipeline: TAIFEX daily quotes with TXF futures as the underlying, implied volatility and Greeks, settlement-price filling for days without trades, put–call-parity conversion of puts;
+- **MultiPatchFormer (MPF)**, adapted from Naghashi et al. (2025) to the option tensors, with its temporal encoder replaced by FANformer layers (Dong et al., 2025): multi-scale patch embedding, channel-wise attention and a single-step decoder;
+- a **dual-branch network**: ConvLSTM branch plus a Transformer branch with a positivity-constrained moneyness projection and date positional encoding, trained with a Black–Scholes PDE residual penalty;
+- density-based sample re-weighting (kernel density estimate over moneyness), rolling-window training with warm starts and a two-model ensemble, VIF-based feature selection, a learning-rate range test;
+- a Kou jump-diffusion benchmark priced with the Carr–Madan FFT, recalibrated daily.
 
-### Key Features
+## Data
 
-- Multiple state-of-the-art deep learning architectures for option pricing
-- 3D tensor-based data representation for capturing complex market dynamics
-- Weighted loss functions based on Kernel Density Estimation (KDE) to handle imbalanced data
-- Rolling window training methodology for time series forecasting
-- Comprehensive evaluation metrics and visualization tools
-- Support for both standard and rolling window training approaches
+| Item | Detail |
+|---|---|
+| Instruments | TXO calls and puts (European, cash-settled); underlying proxy: TXF futures price |
+| Sample | Daily, 2021-01-04 to 2021-12-30 (244 trading days); about 80,800 contract-days after preprocessing. The raw file covers 2014–2021; the scripts keep 2021 |
+| Raw files | `data/TXO_with_TXF.csv` (contract terms, price, underlying, rate, volume) and the TAIFEX daily option quote archives `data/2021_opt.zip`, `data/2022_opt.zip` |
+| Derived fields | Implied volatility (Brent root search), delta, gamma, theta, rho, Black–Scholes theoretical price and margin, moneyness −ln(K/S)/(σ√τ), time value; see `core/functions.py` |
+| Model inputs | `data/prs_dataset_mpf.csv`, `data/prs_dataset_dual.csv`, `data/prs_dataset_new.csv`, and the tensors in `data/torch-data/` |
+
+Input tensors (samples × channels × days × features):
+
+| Model | Shape | Channels |
+|---|---|---|
+| MPF | N × 3 × 10 × 4 | (volume, strike, moneyness, time value), (delta, rho, theta, gamma), (previous settlement, settlement change, theoretical margin, theoretical price) |
+| ConvLSTM, dual-branch | N × 3 × 10 × 5 | (volume, call/put flag, time to maturity, implied volatility, strike), five Greeks, (previous settlement, change, underlying, theoretical margin, theoretical price); the dual-branch model also receives N × 1 × 10 × 2 with transformed moneyness and date position |
+
+Targets: next-day option price (ConvLSTM, dual-branch) or next-day time value (MPF).
 
 ## Models
 
-The project implements several deep learning architectures:
+| Model | File | Summary |
+|---|---|---|
+| ConvLSTM, LSTM, CNN+RNN | `core/models_convlstm.py`, `core/models_lstm.py`, `core/models_CNN_RNN.py` | Baselines following Ge et al. (2021) |
+| MultiPatchFormer | `core/models_multi_patch_former_adjusted.py`, `core/models_fanformer.py` | Conv1d patch embeddings with kernels 2–5 plus a global token; three FANformer layers (periodic projections, rotary embeddings, SwiGLU), 4 heads, width 128; gated channel-wise attention; about 2.3M parameters |
+| Dual-branch network | `core/models_dual_network.py` | ConvLSTM branch (16/8/1 channels) and an MPF encoder branch whose moneyness projection has softplus-constrained weights; fusion MLP 256–128–1; about 4.3M parameters. Loss = weighted MSE + 0.1 × squared Black–Scholes PDE residual (autograd derivatives with respect to time and underlying, r = 0.79%) |
+| Kou benchmark | `core/benchmarks_fftoption.py` | Double-exponential jump diffusion via Carr–Madan FFT, calibrated on day *t*, tested on day *t+1* |
 
-### MultiPatchFormer (MPF)
+Training: Adam (1e-4), batch size 64, up to 100 epochs with early stopping; MPF uses linear warm-up and cosine decay, the dual-branch network uses ReduceLROnPlateau.
 
-A transformer-based model that uses multi-scale patch embedding to process option data. The model is designed to handle 3D tensor input with shape (batch_size, channels, sequence_length, features). Key components include:
+## Evaluation protocol
 
-- **Multi-Scale Embedding**: Processes input data at different scales using convolutional layers with various kernel sizes and strides to capture patterns at different resolutions
-- **Temporal Encoder**: Captures temporal dependencies using transformer encoder layers that model relationships between tokens in the sequence
-- **Channel-wise Encoder**: Processes relationships across different features using multi-head attention to capture cross-feature interactions
-- **Token Attention**: Combines information from different tokens using an attention mechanism that weights the importance of each token
-- **Single-Step Decoder**: Generates the final option price prediction by fusing information across features
-
-The MPF model is implemented in both standard and rolling window versions, allowing for different training methodologies.
-
-### Dual Branch Network
-
-A hybrid architecture that combines ConvLSTM and Transformer branches to leverage the strengths of both approaches:
-
-- **ConvLSTM Branch**: Captures spatio-temporal patterns in the data using convolutional LSTM cells that process the 3D tensor input (batch_size, channels, sequence_length, features)
-- **Transformer Branch**: Models long-range dependencies and complex relationships using a transformer encoder with positional encoding for both sequence positions and date information
-- **PDE-Guided Loss**: Incorporates financial domain knowledge through partial differential equations based on the Black-Scholes model, calculating derivatives with respect to time and underlying price
-- **Fusion Layer**: Combines outputs from both branches using fully connected layers to generate the final prediction
-
-The dual branch approach allows the model to capture both local patterns through the ConvLSTM and global dependencies through the transformer.
-
-### ConvLSTM and CNN-RNN Models
-
-Additional architectures that serve as baselines and alternatives:
-
-- **ConvLSTM**: Combines convolutional and LSTM layers for spatio-temporal modeling
-  - Uses ConvLSTM cells with 1D convolutions to process sequential data
-  - Includes layer normalization and batch normalization for stable training
-  - Implements a multi-layer architecture with skip connections
-  - Uses softplus activation for ensuring positive option price outputs
-
-- **CNN-RNN**: Sequential combination of CNN for feature extraction and RNN for temporal modeling
-  - Uses multi-scale CNN with different dilation rates to capture patterns at various time scales
-  - Implements bidirectional GRU layers for sequence modeling
-  - Combines CNN and RNN outputs through residual connections
-  - Uses group normalization for improved training stability
-
-## Data Processing
-
-The project includes comprehensive data processing pipelines:
-
-- **Data Preprocessing**: Cleans and transforms raw option data
-- **Feature Engineering**: Calculates financial metrics like implied volatility, Greeks, and moneyness
-- **Normalization**: Standardizes input features for better model training
-- **Tensor Creation**: Converts processed data into 3D tensors for model input
-
-## Training Methodologies
-
-### Standard Training
-
-- Splits data into training, validation, and test sets based on time periods
-- Uses weighted loss based on Kernel Density Estimation (KDE) to handle data imbalance:
-  ```python
-  # Extract moneyness values
-  moneyness = x_input[:, 0, -1, 4].detach().cpu().numpy()
-  # Calculate weights using KDE
-  weights = 1.0 / (kde_model(moneyness.reshape(1, -1)) + 1e-6)
-  # Normalize weights
-  weights = weights / mean_weights
-  # Compute weighted MSE loss
-  mse_loss = torch.mean(weights * (predicted - target) ** 2)
-  ```
-- Implements early stopping with patience to prevent overfitting
-- Uses learning rate scheduling with ReduceLROnPlateau to adapt learning rates
-- Applies gradient clipping to prevent exploding gradients
-- Tracks and visualizes training progress with detailed loss curves
-
-### Rolling Window Training
-
-- Implements a time-based rolling window approach for time series forecasting:
-  ```
-  Window 1: Train[t₁:t₂] → Valid[t₂:t₃] → Test[t₃:t₄]
-  Window 2: Train[t₂:t₅] → Valid[t₅:t₆] → Test[t₆:t₇]
-  ...
-  ```
-- Supports both fixed-window and expanding-window methodologies
-- Enables transfer learning between consecutive windows by initializing each window's model with the previous window's weights
-- Provides ensemble prediction capabilities by combining predictions from multiple models:
-  ```python
-  # Adaptive ensemble based on validation performance
-  selected_models, weights = adaptive_ensemble(all_window_models, window_data, device)
-  # Weighted ensemble prediction
-  output = ensemble_predict(selected_models, weights, x_input, device)
-  ```
-- Visualizes performance metrics across windows to analyze temporal patterns
-
-## Project Structure
-
-### Data Folder
-- Contains option and stock data
-- Includes raw CSV files, processed data, and PyTorch tensors
-- Key files:
-  - `prs_dataset_mpf.csv`, `prs_dataset_dual.csv`: Processed datasets
-  - `torch-data/`: Contains preprocessed PyTorch tensors for training
-
-### Core Folder
-- Contains model implementations and data processing scripts
-- Key files:
-  - `models_multi_patch_former.py`, `models_multi_patch_former_adjusted.py`: MPF model implementations
-  - `models_dual_network.py`: Dual branch network implementation
-  - `models_convlstm.py`: ConvLSTM model implementation
-  - `models_CNN_RNN.py`: CNN-RNN model implementation
-  - `data_preprocess_*.py`: Data preprocessing pipelines
-  - `functions.py`: Utility functions for option pricing and metrics
-
-### Main Folder
-- Contains training and evaluation scripts
-- Key files:
-  - `main_mpf_network.py`: Standard MPF training script
-  - `main_mpf_rolling_network.py`: Rolling window MPF training script
-  - `main_dual_network.py`: Dual network training script
-  - `main_convlstm.py`: ConvLSTM training script
-  - `main_CNN_RNN.py`: CNN-RNN training script
-  - `visualization.ipynb`: Result visualization notebook
-  - `checkpoints/`: Saved model weights and optimizer states
-
-## Usage
-
-### Data Preparation
-
-1. Preprocess raw option data:
-   ```
-   python core/data_preprocess_taiex_option_type2_mpf.py
-   ```
-
-2. For dual network data:
-   ```
-   python core/data_preprocess_taiex_option_type2_dual.py
-   ```
-
-### Model Training
-
-1. Train the MultiPatchFormer model:
-   ```
-   python main/main_mpf_network.py -max_epoch 100 -batch_size 64 -early_stop_mode True
-   ```
-
-2. Train with rolling window approach:
-   ```
-   python main/main_mpf_rolling_network.py -max_epoch 50 -batch_size 64 -early_stop_mode True
-   ```
-
-3. Train the Dual Branch Network:
-   ```
-   python main/main_dual_network.py -max_epoch 100 -batch_size 64 -early_stop_mode True
-   ```
-
-### Evaluation and Visualization
-
-1. Test a trained model:
-   ```
-   python main/main_mpf_network.py -test_checkpoint checkpoints/mpf_network_best.pth
-   ```
-
-2. Visualize results:
-   ```
-   jupyter notebook main/visualization.ipynb
-   ```
+- **Static split** (`core/data_preprocess_taiex_option_type2*.py`): the year is cut into 16 non-overlapping blocks of 15 trading days. In each block days 1–10 are history only, days 11–13 provide training labels, day 14 validation labels and day 15 test labels (12,980 / 4,035 / 3,846 samples for MPF). `Data_preprocess.pdf` sketches the scheme.
+- **Rolling windows** (`main/main_mpf_rolling_network.py`): train, validate and test on consecutive date ranges, slide forward, warm-start from the previous window, average the two best models. Normalization statistics come from the training part only.
 
 ## Results
 
-The models are evaluated using multiple metrics:
+Stored test metrics, static split, option-price units (index points):
 
-- Mean Absolute Percentage Error (MAPE): Measures the percentage difference between predicted and actual prices
-- Mean Absolute Error (MAE): Measures the absolute difference between predicted and actual prices
-- Correlation coefficient: Measures the linear relationship between predicted and actual prices
-- MSE loss: Measures the squared difference between predicted and actual prices
+| Model | MSE | MAE | Correlation | Source |
+|---|---|---|---|---|
+| ConvLSTM baseline | 12,632.7 | 57.97 | 0.9750 | `main/testing_result/convlstm_testing_result(syn).txt` |
+| Dual-branch network | 6,482.7 | 52.74 | 0.9870 | `main/testing_result/dualnetwork_testing_result(syn).txt` |
+| MultiPatchFormer | 6,854.8 | 42.75 | 0.9877 | `main/testing_result/mpf_testing_result(syn).txt` |
 
-Visualization tools include:
-- 3D plots of predicted vs. actual option prices with moneyness and time-to-maturity as axes
-- Loss curves over training epochs showing training, validation, and test losses
-- Time-based performance analysis across different market conditions
-- Cumulative performance metrics for rolling window models
+The dual-branch network lowers the ConvLSTM baseline's test MSE by 48.7% on the same target. `main/check_monotonic.py` additionally checks a no-arbitrage property of the predictions, that call prices decrease in strike for each maturity; the stored plot shows it for 2021-05-03:
 
-Example visualization:
-```python
-# Create 3D visualization
-fig = plt.figure(figsize=(15, 10))
-ax = fig.add_subplot(111, projection='3d')
-ax.scatter(moneyness, time_to_maturity, true_prices, c='blue', marker='o', label='True Prices')
-ax.scatter(moneyness, time_to_maturity, estimated_prices, c='red', marker='^', label='Estimated Prices')
+![Predicted call prices against strike for each maturity on 2021-05-03](main/check_monotic_test.png)
+
+Stricter tests:
+
+- Rolling windows, MPF, 12 windows pooled (10,476 test samples, `main/testing_result/rolling_windows/all_window_results_Mar07_092454.csv`): RMSE 215.1, MAE 108.6, correlation 0.907. The weakest window covers the May 2021 sell-off.
+- Kou benchmark with daily recalibration (`core/result/kjdate_loss_message_dataframe.csv`, 138 days to 2021-07-30): mean daily MSE 5,305.7. It is evaluated on a different sample from the networks, so the figures are not directly comparable.
+
+## Known issues and limitations
+
+The static-split numbers above are optimistic. They are reported as stored; the points below explain why they should be read with care.
+
+1. **Interleaved split.** Test days are spread through 2021 and lie one or two days after training labels of the same contracts, and later training blocks come after earlier test days. It measures interpolation within a regime rather than forecasting an unseen period; the rolling-window result is the more honest estimate and is much weaker.
+2. **Per-split normalization.** In the static scripts each split is standardized with its own mean and standard deviation, and test predictions are converted back with the test labels' statistics. Only the rolling script uses training-set statistics throughout.
+3. **MPF sample weights are inactive.** In `main/main_mpf_network.py` the density estimate is fitted on raw values but evaluated on standardized inputs, so all weights are equal and the loss reduces to plain MSE. The dual-branch and rolling scripts weight by moneyness.
+4. **Near-circular inputs.** The theoretical price is Black–Scholes evaluated at the implied volatility backed out of the same day's price, so the inputs contain yesterday's price almost exactly. No "yesterday's price" baseline is included, and it should be the first comparison added.
+5. **Soft constraint only.** The PDE term is a penalty with weight 0.1 computed on standardized inputs; it encourages, but does not enforce, consistency with Black–Scholes dynamics.
+6. **Scope.** One market and one year of daily settlement data, single runs without fixed seeds, no bid–ask spreads, and no hedging or trading test. Missing underlying values are interpolated linearly, and no-trade days are filled with settlement prices.
+7. **Mixed artifacts.** Checkpoints, tensors and result files in the repository come from several code versions; `data/train_data.csv`, `data/test_data.csv` and `data/test_data_BS.csv` are 50ETF files from the original study, not TXO data.
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `core/` | Model definitions, preprocessing scripts (`data_preprocess_taiex_option_type2_mpf.py`, `..._dual.py`, `process_complementary_data.py`), pricing utilities (`functions.py`), FFT benchmark and its results |
+| `main/` | Training and evaluation entry points (`main_mpf_network.py`, `main_mpf_rolling_network.py`, `main_dual_network.py`, `main_convlstm.py`, `main_lstm.py`, `main_CNN_RNN.py`), learning-rate range test, metric and monotonicity checks, `visualization.ipynb` |
+| `main/checkpoints/`, `main/loss_curves/`, `main/testing_result/` | Generated weights, loss curves and test outputs |
+| `data/` | Raw and processed data, `torch-data/` tensors |
+| `feature_analysis/` | VIF feature selection and distribution analysis |
+| `Data_preprocess.pdf` | Diagram of the static split |
+
+## Running
+
+```bash
+pip install -r requirements.txt
+
+cd core
+python data_preprocess_taiex_option_type2_mpf.py     # or ..._dual.py
+cd ../main
+python main_mpf_network.py                           # static split, MPF
+python main_dual_network.py                          # static split, dual-branch network
+python main_mpf_rolling_network.py                   # rolling windows
 ```
 
-## Requirements
+The scripts were developed on three machines and still contain absolute paths (`/home/...`, `C:\Users\...`, `/Users/...`); set the data directory at the top of each script first. `main_mpf_network.py` selects the Apple `mps` device explicitly; change it to `cuda` or `cpu` as needed. Run the preprocessing scripts from `core/` and the training scripts from `main/`, since they use relative imports and output folders.
 
-- Python 3.7+
-- PyTorch 1.8+
-- NumPy
-- Pandas
-- Matplotlib
-- SciPy
-- tqdm
+## References
 
-## Citation
-
-If you use this code in your research, please cite:
-```
-@article{3DTensorOptionPricing,
-  title={3D Tensor-based Deep Learning Models for Predicting Option Price},
-  author={},
-  journal={},
-  year={}
-}
-```
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+- M. Ge, S. Zhou, S. Luo, B. Tian. 3D Tensor-based Deep Learning Models for Predicting Option Price. arXiv:2106.02916, 2021.
+- V. Naghashi, M. Boukadoum, A. B. Diallo. A multiscale model for multivariate time series forecasting (MultiPatchFormer). Scientific Reports 15, 2025. doi:10.1038/s41598-024-82417-4
+- Y. Dong et al. FANformer: Improving Large Language Models Through Effective Periodicity Modeling. arXiv:2502.21309, 2025.
+- S. G. Kou. A Jump-Diffusion Model for Option Pricing. Management Science 48(8), 2002.
+- P. Carr, D. Madan. Option Valuation Using the Fast Fourier Transform. Journal of Computational Finance 2(4), 1999.
