@@ -1,6 +1,13 @@
-# Deep Learning for TAIEX Option Pricing with 3D Tensor Inputs
+# Constrained Deep Learning for Option Pricing
 
-Undergraduate research project (National Yang Ming Chiao Tung University, 2024–2025) on one-day-ahead pricing of TAIEX index options (TXO). Each contract's last 10 trading days are arranged as a three-channel tensor (contract terms and volume, Greeks, prices) and passed to convolutional-recurrent and Transformer models.
+Undergraduate thesis project (National Yang Ming Chiao Tung University, 2024–2025) on one-day-ahead pricing of TAIEX index options (TXO) with neural networks that carry financial structure in their architecture and loss, instead of fitting prices as a free regression. Each contract's last 10 trading days are arranged as a three-channel tensor (contract terms and volume, Greeks, prices) and passed to convolutional-recurrent and Transformer models.
+
+| Constraint | Where | How |
+|---|---|---|
+| Consistency with the Black–Scholes PDE | Loss of the dual-branch network | Squared PDE residual from autograd derivatives with respect to time and underlying, weight 0.1 (soft penalty) |
+| Monotonicity prior in moneyness | Transformer branch of the dual-branch network | `ConstrainedLinear`: softplus-positive weights in the moneyness input projection (later layers are unconstrained) |
+| Non-negative prices | ConvLSTM output | Softplus output activation |
+| Call prices decreasing in strike | Evaluation | `main/check_monotonic.py` checks the predictions per date and maturity |
 
 The tensor representation and the ConvLSTM / LSTM baselines follow **Ge, Zhou, Luo and Tian (2021), "3D Tensor-based Deep Learning Models for Predicting Option Price"** ([arXiv:2106.02916](https://arxiv.org/abs/2106.02916)), which studied Chinese 50ETF options. This repository applies the framework to the Taiwan market and extends it:
 
